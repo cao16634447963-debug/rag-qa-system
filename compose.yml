@@ -1,0 +1,10 @@
+services:
+  rag:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    volumes:
+      - ./server/data:/app/server/data
+      - ./docs:/app/docs
+    restart: unless-stopped

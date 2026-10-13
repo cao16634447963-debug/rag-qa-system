@@ -1,0 +1,9 @@
+.env
+node_modules
+dist
+web/dist
+web/node_modules
+server/data
+.git
+compose.yml
+Dockerfile
