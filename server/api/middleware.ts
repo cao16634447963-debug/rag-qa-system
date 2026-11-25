@@ -1,25 +1,9 @@
 import type { NextFunction, Request, Response } from 'express';
 
 /**
- * API 中间件：可选鉴权 + 按 IP 的滑动窗口限流
+ * API 中间件：按 IP 的滑动窗口限流
+ * （鉴权已迁移到用户体系：server/auth/middleware.ts 的 requireAuth）
  */
-
-/**
- * 可选鉴权：.env 设置了 API_TOKEN 时启用，要求请求头 x-api-token 匹配；
- * 未设置则不启用（本地开发零配置）
- */
-export const auth = (req: Request, res: Response, next: NextFunction): void => {
-    const token = process.env.API_TOKEN;
-    if (!token) {
-        next();
-        return;
-    }
-    if (req.header('x-api-token') === token) {
-        next();
-        return;
-    }
-    res.status(401).json({ error: '未授权：请通过 x-api-token 请求头携带访问令牌' });
-};
 
 type Bucket = number[];
 

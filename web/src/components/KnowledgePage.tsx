@@ -28,7 +28,7 @@ const KnowledgePage = () => {
 
     const refresh = useCallback(async () => {
         try {
-            const res = await fetch('/api/documents');
+            const res = await apiFetch('/api/documents');
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = (await res.json()) as { files: IndexedFile[] };
             setFiles(data.files);

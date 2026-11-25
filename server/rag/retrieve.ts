@@ -1,7 +1,8 @@
 import { generateText } from 'ai';
 import { createDeepSeek } from '@ai-sdk/deepseek';
-import { cosine, RAG_PROMPT } from './prompt.js';
-import { loadStore } from './store.js';
+import { RAG_PROMPT } from './prompt.js';
+import { toVectorLiteral } from './store.js';
+import { query as dbQuery } from '../db/pool.js';
 import { embedTexts } from './embed.js';
 import { rerank } from './rerank.js';
 import { TOP_K, SIM_THRESHOLD, CANDIDATE_K, REWRITE_MAX_QUERY_LENGTH } from './config.js';
@@ -46,22 +47,23 @@ const rewriteQuery = async (query: string, contextText?: string): Promise<string
 export const retrieve = async (query: string, contextText?: string): Promise<RetrievedChunk[]> => {
     if (!query.trim()) return [];
 
-    const store = await loadStore();
-    if (store.chunks.length === 0) return [];
-
     const finalQuery = await rewriteQuery(query, contextText);
     const [queryEmbedding] = await embedTexts([finalQuery]);
 
-    // 向量召回候选池
-    const candidates = store.chunks
-        .map((c) => ({
-            file: c.file,
-            index: c.index,
-            text: c.text,
-            cosine: cosine(queryEmbedding, c.embedding),
-        }))
-        .sort((a, b) => b.cosine - a.cosine)
-        .slice(0, CANDIDATE_K);
+    // 向量召回候选池（pgvector HNSW 余弦距离排序）
+    const result = await dbQuery(
+        `SELECT file, idx, text, 1 - (embedding <=> $1::vector) AS cosine
+         FROM chunks
+         ORDER BY embedding <=> $1::vector
+         LIMIT $2`,
+        [toVectorLiteral(queryEmbedding), CANDIDATE_K],
+    );
+    const candidates = result.rows.map((row) => ({
+        file: row.file as string,
+        index: row.idx as number,
+        text: row.text as string,
+        cosine: row.cosine as number,
+    }));
 
     // 重排序精排
     const reranked = await rerank(finalQuery, candidates.map((c) => c.text));

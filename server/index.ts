@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import cookieParser from 'cookie-parser';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -18,7 +19,15 @@ import { createDeepSeek } from '@ai-sdk/deepseek';
 import { retrieve } from './rag/retrieve.js';
 import { AGENT_SYSTEM_PROMPT } from './rag/prompt.js';
 import documentsRouter from './api/documents.js';
-import { auth, rateLimit } from './api/middleware.js';
+import authRouter from './api/auth.js';
+import bookmarksRouter from './api/bookmarks.js';
+import categoriesRouter from './api/categories.js';
+import chatSessionsRouter from './api/chat-sessions.js';
+import { requireAuth, type AuthedRequest } from './auth/middleware.js';
+import { rateLimit } from './api/middleware.js';
+import { ensureSchema } from './db/schema.js';
+import { runMigrations } from './db/migrate.js';
+import { query } from './db/pool.js';
 
 /**
  * ============================================================
@@ -48,16 +57,46 @@ import { auth, rateLimit } from './api/middleware.js';
  */
 
 const app = express();
+app.use(cookieParser());
 app.use(express.json({ limit: '4mb' }));
+// 请求日志（跳过静态文件与健康检查，避免刷屏）
+app.use((req, res, next) => {
+    if (!req.path.startsWith('/api') || req.path === '/api/health') return next();
+    const start = Date.now();
+    res.on('finish', () => {
+        if (res.statusCode >= 400 || !req.path.startsWith('/api/chat')) {
+            console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+        }
+    });
+    next();
+});
 app.use('/api/documents', documentsRouter);
+app.use('/api/auth', authRouter);
+app.use('/api/categories', categoriesRouter);
+app.use('/api/bookmarks', bookmarksRouter);
+app.use('/api/chat/sessions', chatSessionsRouter);
 
 const deepseek = createDeepSeek({ apiKey: process.env.DEEPSEEK_API_KEY });
 
 const MAX_TURNS = 20;
 
-app.get('/api/health', (_req, res) => {
-    res.json({
-        ok: true,
+/** 提取 UIMessage 的纯文本内容 */
+const textOf = (m: UIMessage): string =>
+    m.parts
+        .filter((p) => p.type === 'text')
+        .map((p) => (p.type === 'text' ? p.text : ''))
+        .join('');
+
+app.get('/api/health', async (_req, res) => {
+    let db = 'up';
+    try {
+        await query('SELECT 1');
+    } catch {
+        db = 'down';
+    }
+    res.status(db === 'up' ? 200 : 503).json({
+        ok: db === 'up',
+        db,
         time: new Date().toISOString(),
         env: {
             deepseek: process.env.DEEPSEEK_API_KEY ? 'configured' : 'missing',
@@ -71,7 +110,7 @@ app.get('/api/health', (_req, res) => {
  * 检索作为工具暴露给模型：由模型自主判断是否查知识库（tool 调用多步，最多 5 步）。
  * 工具命中时通过 writer 推送 data-sources（引用来源卡片）；检索/生成失败自动降级。
  */
-app.post('/api/chat', auth, rateLimit(20, 60_000), async (req, res) => {
+app.post('/api/chat', requireAuth, rateLimit(20, 60_000), async (req, res) => {
     const { messages } = req.body as { messages?: UIMessage[] };
     if (!Array.isArray(messages) || messages.length === 0) {
         res.status(400).json({ error: 'messages 必须是非空数组' });
@@ -83,6 +122,43 @@ app.post('/api/chat', auth, rateLimit(20, 60_000), async (req, res) => {
     res.on('close', () => {
         if (!res.writableEnded) abort.abort();
     });
+
+    // 问答历史：客户端在首条消息前创建会话并以 x-session-id 传入，无该头则不落库
+    const { userId } = req as AuthedRequest;
+    const headerSessionId = req.header('x-session-id') ?? '';
+    let session: { id: string } | null = null;
+    if (headerSessionId) {
+        const owned = await query(
+            'SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2',
+            [headerSessionId, userId],
+        );
+        session = owned.rows[0] ?? null;
+    }
+
+    // 落库用户消息（重试场景按最后一条去重）；首条用户消息同时作为会话标题
+    if (session) {
+        const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+        const text = lastUser ? textOf(lastUser).trim() : '';
+        if (text) {
+            const lastRow = await query(
+                'SELECT role, content FROM chat_messages WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1',
+                [session.id],
+            );
+            const prev = lastRow.rows[0] as { role: string; content: string } | undefined;
+            if (!prev || prev.role !== 'user' || prev.content !== text) {
+                await query(
+                    'INSERT INTO chat_messages (session_id, role, content) VALUES ($1, $2, $3)',
+                    [session.id, 'user', text],
+                );
+                await query(
+                    `UPDATE chat_sessions SET updated_at = now(),
+                     title = CASE WHEN title = '新对话' THEN $2 ELSE title END
+                     WHERE id = $1`,
+                    [session.id, text.slice(0, 24)],
+                );
+            }
+        }
+    }
 
     const uiStream = createUIMessageStream({
         execute: async ({ writer }) => {
@@ -139,7 +215,40 @@ app.post('/api/chat', auth, rateLimit(20, 60_000), async (req, res) => {
                 abortSignal: abort.signal,
             });
 
-            writer.merge(result.toUIMessageStream());
+            // 助手回复落库（正常结束或用户中断均保存已生成的文本，并刷新会话时间戳）
+            const saveAssistant = async (text: string): Promise<void> => {
+                if (!session || !text.trim()) return;
+                try {
+                    await query(
+                        'INSERT INTO chat_messages (session_id, role, content) VALUES ($1, $2, $3)',
+                        [session.id, 'assistant', text],
+                    );
+                    await query('UPDATE chat_sessions SET updated_at = now() WHERE id = $1', [session.id]);
+                } catch (err) {
+                    console.error('保存问答记录失败:', err instanceof Error ? err.message : err);
+                }
+            };
+
+            // tee 上游流：一路给客户端，一路累积文本；onFinish 在中断时不触发，
+            // 因此独立消费支流，在流关闭（含 abort 导致的异常关闭）后落库部分文本
+            const [forClient, forSave] = result.toUIMessageStream().tee();
+            void (async () => {
+                let assistantText = '';
+                const reader = forSave.getReader();
+                try {
+                    for (;;) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        if (value?.type === 'text-delta') assistantText += value.delta;
+                    }
+                } catch {
+                    // 中断/异常关闭：保留已累积的部分文本
+                } finally {
+                    await saveAssistant(assistantText);
+                }
+            })();
+
+            writer.merge(forClient);
         },
         onError: (err) => `接口调用失败：${err instanceof Error ? err.message : String(err)}`,
     });
@@ -166,12 +275,22 @@ if (existsSync(WEB_DIST)) {
 }
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-    console.log(`RAG 问答系统后端已启动：http://localhost:${PORT}`);
-    if (!process.env.DEEPSEEK_API_KEY) {
-        console.warn('警告：缺少 DEEPSEEK_API_KEY，聊天功能将不可用');
-    }
-    if (!process.env.SILICONFLOW_API_KEY) {
-        console.warn('警告：缺少 SILICONFLOW_API_KEY，文档摄取与 RAG 检索将不可用');
-    }
-});
+
+// 先确保数据库 schema 就绪并应用迁移，再启动 HTTP 服务
+ensureSchema()
+    .then(runMigrations)
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(`RAG 问答系统后端已启动：http://localhost:${PORT}`);
+            if (!process.env.DEEPSEEK_API_KEY) {
+                console.warn('警告：缺少 DEEPSEEK_API_KEY，聊天功能将不可用');
+            }
+            if (!process.env.SILICONFLOW_API_KEY) {
+                console.warn('警告：缺少 SILICONFLOW_API_KEY，文档摄取与 RAG 检索将不可用');
+            }
+        });
+    })
+    .catch((err: Error) => {
+        console.error(`数据库初始化失败，服务未启动：${err.message}`);
+        process.exit(1);
+    });

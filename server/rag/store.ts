@@ -1,52 +1,48 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-import { EMBED_MODEL, STORE_PATH } from './config.js';
+import { pool } from '../db/pool.js';
 import type { Chunk } from './chunk.js';
+
+/**
+ * RAG 向量库存储层（Postgres + pgvector）
+ * chunks 表主键 (file, idx)，按文件整体替换，pgvector HNSW 余弦索引检索
+ */
 
 export type StoredChunk = Chunk & { embedding: number[] };
 
-export type VectorStore = {
-    model: string;
-    dims: number;
-    updatedAt: string;
-    chunks: StoredChunk[];
-};
+/** number[] → pgvector 字面量（'[1,2,3]'），SQL 中以 ::vector 传入 */
+export const toVectorLiteral = (embedding: number[]): string => `[${embedding.join(',')}]`;
 
-const emptyStore = (): VectorStore => ({
-    model: EMBED_MODEL,
-    dims: 0,
-    updatedAt: new Date().toISOString(),
-    chunks: [],
-});
+/** pgvector 返回的字面量字符串 → number[] */
+export const fromVectorLiteral = (value: string): number[] => JSON.parse(value) as number[];
 
-/** 读取本地向量库（不存在或损坏时返回空库） */
-export const loadStore = async (path = STORE_PATH): Promise<VectorStore> => {
+/**
+ * 替换某文件的全部分块（事务：先删旧再批量插入，重复摄取不产生重复数据）
+ */
+export const replaceFileChunks = async (file: string, chunks: StoredChunk[]): Promise<void> => {
+    const client = await pool.connect();
     try {
-        const raw = await readFile(path, 'utf-8');
-        const store = JSON.parse(raw) as VectorStore;
-        if (!Array.isArray(store.chunks)) return emptyStore();
-        return store;
-    } catch {
-        return emptyStore();
+        await client.query('BEGIN');
+        await client.query('DELETE FROM chunks WHERE file = $1', [file]);
+        if (chunks.length > 0) {
+            const values = chunks
+                .map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4}::vector)`)
+                .join(',');
+            const params = chunks.flatMap((c) => [c.file, c.index, c.text, toVectorLiteral(c.embedding)]);
+            await client.query(
+                `INSERT INTO chunks (file, idx, text, embedding) VALUES ${values}`,
+                params,
+            );
+        }
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
     }
 };
 
-/** 写回向量库文件 */
-export const saveStore = async (store: VectorStore, path = STORE_PATH): Promise<void> => {
-    store.updatedAt = new Date().toISOString();
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, JSON.stringify(store), 'utf-8');
-};
-
-/**
- * 增量更新：替换某文件的全部分块（先删旧再写新）
- * 重复运行 ingest 不会产生重复数据
- */
-export const replaceFileChunks = (
-    store: VectorStore,
-    file: string,
-    chunks: StoredChunk[],
-): void => {
-    store.chunks = store.chunks.filter((c) => c.file !== file).concat(chunks);
-    store.dims = chunks[0]?.embedding.length || store.dims;
+/** 删除某文件的全部分块，返回删除的块数 */
+export const deleteFileChunks = async (file: string): Promise<number> => {
+    const result = await pool.query('DELETE FROM chunks WHERE file = $1', [file]);
+    return result.rowCount ?? 0;
 };

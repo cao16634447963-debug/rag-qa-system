@@ -1,11 +1,12 @@
 import { Router } from 'express';
-import { writeFile, unlink } from 'node:fs/promises';
+import { mkdir, writeFile, unlink } from 'node:fs/promises';
 import { join, basename, extname } from 'node:path';
 import { ingestText, listIndexed } from '../rag/ingest.js';
-import { loadStore, saveStore, replaceFileChunks } from '../rag/store.js';
+import { deleteFileChunks } from '../rag/store.js';
 import { extractPdfText } from '../rag/parse.js';
-import { DOC_EXTENSIONS, STORE_PATH } from '../rag/config.js';
-import { auth, rateLimit } from './middleware.js';
+import { DOC_EXTENSIONS } from '../rag/config.js';
+import { requireAuth } from '../auth/middleware.js';
+import { rateLimit } from './middleware.js';
 
 /**
  * 知识库文档管理 API
@@ -15,16 +16,22 @@ import { auth, rateLimit } from './middleware.js';
  * PDF 走 base64 编码上传，纯文本走 utf8（默认）
  */
 
-const DOCS_DIR = 'docs';
+// 源文件目录：可用 DOCS_DIR 覆盖（只读文件系统环境如容器/云部署写 /tmp）
+const DOCS_DIR = process.env.DOCS_DIR || 'docs';
 /** 上传大小上限：纯文本 2MB，PDF 10MB */
 const MAX_TEXT_LENGTH = 2_000_000;
 const MAX_PDF_LENGTH = 10_000_000;
 
+/** 确保源文件目录存在（目录可能随环境变化或被清理） */
+const ensureDocsDir = async (): Promise<void> => {
+    await mkdir(DOCS_DIR, { recursive: true });
+};
+
 const router = Router();
-router.use(auth, rateLimit(30, 60_000));
+router.use(requireAuth, rateLimit(30, 60_000));
 
 router.get('/', async (_req, res) => {
-    res.json({ files: await listIndexed(STORE_PATH) });
+    res.json({ files: await listIndexed() });
 });
 
 router.post('/', async (req, res) => {
@@ -86,13 +93,16 @@ router.post('/', async (req, res) => {
         return;
     }
 
+    await ensureDocsDir();
     await writeFile(join(DOCS_DIR, safeName), fileData);
     try {
         const chunks = await ingestText(safeName, text);
         res.json({ ok: true, file: safeName, chunks });
     } catch (err) {
         // 摄取失败：回滚源文件
-        await unlink(join(DOCS_DIR, safeName)).catch(() => {});
+        await unlink(join(DOCS_DIR, safeName)).catch((e: unknown) =>
+            console.error('摄取失败后清理源文件出错:', e instanceof Error ? e.message : e),
+        );
         res.status(500).json({ error: `摄取失败：${err instanceof Error ? err.message : String(err)}` });
     }
 });
@@ -100,19 +110,19 @@ router.post('/', async (req, res) => {
 router.delete('/:name', async (req, res) => {
     const name = basename(decodeURIComponent(req.params.name));
 
-    const store = await loadStore(STORE_PATH);
-    const before = store.chunks.length;
-    replaceFileChunks(store, name, []);
-    await saveStore(store, STORE_PATH);
-
-    const removed = before - store.chunks.length;
+    const removed = await deleteFileChunks(name);
     if (removed === 0) {
         res.status(404).json({ error: `知识库中不存在：${name}` });
         return;
     }
 
-    // 同步删除源文件（不存在则忽略）
-    await unlink(join(DOCS_DIR, name)).catch(() => {});
+    // 同步删除源文件（不存在则忽略，其他错误记录日志便于发现磁盘残留）
+    await unlink(join(DOCS_DIR, name)).catch((e: unknown) => {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code !== 'ENOENT') {
+            console.error(`删除源文件失败 ${name}:`, e instanceof Error ? e.message : e);
+        }
+    });
     res.json({ ok: true, file: name, removedChunks: removed });
 });
 

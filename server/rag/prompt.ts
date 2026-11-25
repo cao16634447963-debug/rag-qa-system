@@ -1,20 +1,6 @@
 /**
- * Prompt 拼装与相似度计算
+ * Prompt 拼装
  */
-
-/** 余弦相似度：两向量方向一致性，0~1，越接近 1 语义越相似 */
-export const cosine = (a: number[], b: number[]): number => {
-    let dot = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < a.length; i++) {
-        dot += a[i] * b[i];
-        normA += a[i] * a[i];
-        normB += b[i] * b[i];
-    }
-    const denom = Math.sqrt(normA) * Math.sqrt(normB);
-    return denom === 0 ? 0 : dot / denom;
-};
 
 const RAG_INSTRUCTION = `你是基于知识库的中文问答助手，回答使用 Markdown 格式。请遵守：
 1. 优先依据下方【知识库片段】回答用户问题；

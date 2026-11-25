@@ -1,7 +1,7 @@
 import { chunkText } from './chunk.js';
 import { embedTexts } from './embed.js';
-import { loadStore, saveStore, replaceFileChunks } from './store.js';
-import { STORE_PATH } from './config.js';
+import { replaceFileChunks } from './store.js';
+import { query } from '../db/pool.js';
 
 /**
  * 摄取核心逻辑（CLI 与 HTTP API 共用）：
@@ -13,13 +13,10 @@ export const ingestText = async (relPath: string, content: string): Promise<numb
     if (chunks.length === 0) return 0;
 
     const embeddings = await embedTexts(chunks.map((c) => c.text));
-    const store = await loadStore(STORE_PATH);
-    replaceFileChunks(
-        store,
+    await replaceFileChunks(
         relPath,
         chunks.map((c, i) => ({ ...c, embedding: embeddings[i] })),
     );
-    await saveStore(store, STORE_PATH);
     return chunks.length;
 };
 
@@ -32,14 +29,14 @@ export type IndexedFile = {
 };
 
 /** 列出向量库中已索引的文件及统计 */
-export const listIndexed = async (path = STORE_PATH): Promise<IndexedFile[]> => {
-    const store = await loadStore(path);
-    const map = new Map<string, IndexedFile>();
-    for (const c of store.chunks) {
-        const entry = map.get(c.file) ?? { file: c.file, chunks: 0, chars: 0 };
-        entry.chunks += 1;
-        entry.chars += c.text.length;
-        map.set(c.file, entry);
-    }
-    return [...map.values()];
+export const listIndexed = async (): Promise<IndexedFile[]> => {
+    const result = await query(
+        `SELECT file, COUNT(*)::int AS chunks, COALESCE(SUM(LENGTH(text)), 0)::int AS chars
+         FROM chunks GROUP BY file ORDER BY file`,
+    );
+    return result.rows.map((row) => ({
+        file: row.file as string,
+        chunks: row.chunks as number,
+        chars: row.chars as number,
+    }));
 };

@@ -15,9 +15,6 @@ export const CHUNK_OVERLAP = 100;
 /** 单次 Embedding 请求的最大文本条数（供应商批量上限内取保守值） */
 export const EMBED_BATCH_SIZE = 16;
 
-/** 向量存储文件 */
-export const STORE_PATH = 'server/data/vectors.json';
-
 /** 支持摄取的文档扩展名 */
 export const DOC_EXTENSIONS = ['.txt', '.md', '.pdf'];
 

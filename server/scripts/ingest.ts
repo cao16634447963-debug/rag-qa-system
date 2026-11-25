@@ -3,7 +3,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, extname, resolve, dirname } from 'node:path';
 import { ingestText, listIndexed } from '../rag/ingest.js';
 import { extractPdfText } from '../rag/parse.js';
-import { DOC_EXTENSIONS, STORE_PATH } from '../rag/config.js';
+import { DOC_EXTENSIONS } from '../rag/config.js';
 
 /**
  * 文档摄取 CLI：
@@ -53,9 +53,9 @@ const main = async () => {
         console.log(`  ${chunks} 块完成`);
     }
 
-    const all = await listIndexed(STORE_PATH);
+    const all = await listIndexed();
     console.log(`\n完成：本次摄取 ${totalChunks} 个分块`);
-    console.log(`向量库：${STORE_PATH}（已索引 ${all.length} 个文件，共 ${all.reduce((n, f) => n + f.chunks, 0)} 块）`);
+    console.log(`向量库：Postgres chunks 表（已索引 ${all.length} 个文件，共 ${all.reduce((n, f) => n + f.chunks, 0)} 块）`);
 };
 
 main().catch((err: Error) => {
